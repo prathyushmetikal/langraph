@@ -1,0 +1,99 @@
+
+RAG (Retrieval-Augmented Generation): Combine a retriever (vector search or other) to fetch relevant documents, then condition an LLM with those documents to produce grounded answers. Key pieces: embedding/index, retriever, prompt template, LLM generation, and result assembly.
+Corrective RAG: RAG with an explicit feedback/verification loop — retrieved documents are graded or validated; irrelevant or low-quality results trigger corrective steps (re-retrieval, web search, reranking, or filtration) before final generation. Helps reduce hallucination and improves precision.
+Components you should mention in interviews: retriever, document store/embeddings, prompt templates, LLM chain, relevance grader/reranker, conditional control flow (decisions to re-run retrieval or call web search), and node/graph orchestration.
+How this project implements those concepts (file map)
+
+main.py — Orchestrates the graph/workflow: defines nodes and conditional edges and runs the whole pipeline (entry point, decision logic).
+consts.py — Defines node names/constants: RETRIEVE, GRADE_DOCUMENTS, GENERATE, WEBSEARCH.
+state.py — GraphState TypedDict: canonical state fields (question, documents, generation, web_search).
+graph.py — (Workflow engine) builds and compiles the state graph used to sequence nodes and conditional edges.
+main.py — Example runner that invokes the compiled graph (app.invoke(...)) and can draw the workflow.
+retrieve.py — Retriever node: calls ingestion.retriever.invoke(question) to fetch documents (the retrieval step of RAG).
+retrieval_grader.py — Structured LLM grader: grades each retrieved document as relevant (yes/no)—this is the corrective layer that decides whether to proceed or trigger web search.
+grade_documents.py — Node that applies the retrieval_grader, filters relevant docs, and sets web_search=True if any doc is irrelevant (implements corrective logic).
+generation_chain.py — Builds the LLM generation chain: prompt template + LLM + output parser to generate final answers from filtered context.
+generate.py — Final generation node: calls the generation chain with question and filtered documents, returns the generation.
+ingestion.py (referenced from retrieve.py) — responsible for exposing or building the retriever (embedding/index + search). Inspect this to see what vector store or source connectors are used.
+Root-level main.py, nodes.py, react.py, README.md — top-level project utilities, examples, or UI integration (scan if you need higher-level app wiring or documentation).
+
+
+I've added token-budgeting, pruning, tool-result separation, recursion limits, and conditional context injection across these files:
+
+state.py — added tool_results, recursion_depth, and token_budget to the GraphState shape so nodes can persist tool outputs and track corrective loop depth.
+
+utils.py (new) — utilities:
+
+estimate_tokens(text) — rough token estimator.
+combined_documents_text(docs) — join docs safely.
+prune_documents_by_token_budget(docs, max_tokens) — deterministic left-to-right pruning to fit a token budget.
+summarize_documents(docs, max_chars_per_doc) — lightweight truncation (placeholder for real summarization).
+store_tool_result(state, key, result) — central helper to keep tool outputs out of prompt context.
+should_inject_full_context(docs, max_tokens) and get_token_budget_from_env().
+generate.py — generation node now:
+
+Reads a token budget (state['token_budget'] or env RAG_TOKEN_BUDGET).
+Estimates tokens for full context and logs estimates.
+If context fits the budget, injects full documents into the prompt.
+If not, prunes documents to fit the budget, produces summaries, stores full docs and pruned docs under state['tool_results'], and passes only summaries into the LLM.
+Prints monitoring lines showing decisions (can be parsed by monitoring tools).
+grade_documents.py — grading node now:
+
+Stores per-document grades into state['tool_results']['retrieval_grades'] for audit/monitoring.
+Implements RAG_RECURSION_LIMIT (env, default 3) and increments state['recursion_depth'] when web_search is triggered; stops further web searches if the limit is exceeded and logs this.
+retrieve.py — retrieve node now:
+
+Stores raw retrieval results into state['tool_results']['raw_retrieval'] (tool/result separation).
+Initializes recursion_depth and token_budget defaults on the state so downstream nodes can rely on them.
+How these changes mitigate token explosion
+
+State/tool-result separation: full retrieval results and grader outputs are stored in state['tool_results'] and not automatically injected into prompts. Only summaries or pruned subsets are passed to the LLM.
+Token budgeting and pruning: before generation we estimate tokens and either inject full context or prune + summarize until a budget fits. This avoids sending very large contexts to the LLM.
+Conditional logic outside prompts: the decision to prune or inject full docs is implemented in node code (not in prompt text), so the LLM doesn't need to reason about whether to use tool results — the runtime enforces it.
+Recursion limit: RAG_RECURSION_LIMIT prevents corrective loops from repeating indefinitely when grading triggers web searches.
+Monitoring hooks: each place prints monitoring info ([monitor] ...) and stores grader outputs and raw retrievals in state['tool_results']. These can be scraped by logs or exported to observability tooling.
+How to monitor token usage and corrective behavior
+
+Watch console logs for lines like:
+[monitor] estimated tokens for context: <n>; budget: <m>
+[monitor] context too large — stored full docs in state['tool_results'] and passing summaries
+[monitor] web_search requested; recursion_depth=<d>
+[monitor] recursion limit <n> exceeded — stopping further web searches
+Inspect state['tool_results'] after pipeline runs to see:
+raw_retrieval — original retrieved documents
+retrieval_grades — per-document grades (yes/no)
+documents, pruned_documents, document_summaries — what was stored vs what was injected
+Optionally wire these prints and state['tool_results'] to a metrics/logging system (Prometheus, Datadog, or simple file logs) to alert when pruning happens frequently or when recursion depth reaches the limit.
+
+
+===>
+
+Replaced the naive token estimator with tiktoken-backed estimate_tokens() (fallback to heuristic) in utils.py.
+Added a summarization chain at summarization_chain.py.
+Updated generate.py to use the summarization chain (with fallback) and to store full documents in state['tool_results'] when the token budget is exceeded.
+Kept a lightweight fallback summarizer in graph/utils.py (truncation) if the LLM summarizer is unavailable.
+Added a unit test test_generate_pruning.py that mocks the generation chain, sets a small token_budget, runs generate(), and asserts:
+state['tool_results']['documents'] contains the original documents (tool-result separation),
+the generation chain was invoked with a context that is a string (summaries), not the full doc list.
+
+====>
+
+
+Working Responses after tokenexplosion code addition. 
+C:\Users\prathyush.metikal\Downloads\langraph\langraph\.venv\Lib\site-packages\langchain_openai\chat_models\base.py:2181: UserWarning: Cannot use method='json_schema' with model gpt-3.5-turbo since it doesn't support OpenAI's Structured Output API. You can see supported models here: https://platform.openai.com/docs/guides/structured-outputs#supported-models. To fix this warning, set `method='function_calling'. Overriding to method='function_calling'.
+  warnings.warn
+Hello Advanced Corrective RAG
+Retrieving relevant documents for the question.
+---CHECK DOCUMENT RELEVANCE TO QUESTION---
+---GRADE: DOCUMENT RELEVANT---
+---GRADE: DOCUMENT RELEVANT---
+---GRADE: DOCUMENT RELEVANT---
+---GRADE: DOCUMENT RELEVANT---
+---ASSESS GRADED DOCUMENTS---
+---DECISION: GENERATE---
+---GENERATE ----
+[monitor] estimated tokens for context: 708; budget: 3000
+[monitor] injecting full context into generation prompt
+{'question': 'what is agent memory?', 'generation': 'Agent memory consists of short-term memory and long-term memory. Short-term memory is utilized for in-context learning, while long-term memory allows the agent to retain and recall infinite information over extended periods by leveraging an external vector store for fast retrieval.', 'web_search': False, 'documents': [Document(id='189256fb-d056-4706-8c96-3451eb81bcf7', metadata={'language': 'en', 'title': "LLM Powered Autonomous Agents | Lil'Log", 'description': 'Building agents with LLM (large language model) as its core controller is a cool concept. Several proof-of-concepts demos, such as AutoGPT, GPT-Engineer and BabyAGI, serve as inspiring examples. The potentiality of LLM extends beyond generating well-written copies, stories, essays and programs; it can be framed as a powerful general problem solver.\nAgent System Overview\nIn a LLM-powered autonomous agent system, LLM functions as the agent’s brain, complemented by several key components:\n\nPlanning\n\nSubgoal and decomposition: The agent breaks down large tasks into smaller, manageable subgoals, enabling efficient handling of complex tasks.\nReflection and refinement: The agent can do self-criticism and self-reflection over past actions, learn from mistakes and refine them for future steps, thereby improving the quality of final results.\n\n\nMemory\n\nShort-term memory: I would consider all the in-context learning (See Prompt Engineering) as utilizing short-term memory of the model to learn.\nLong-term memory: This provides the agent with the capability to retain and recall (infinite) information over extended periods, often by leveraging an external vector store and fast retrieval.\n\n\nTool use\n\nThe agent learns to call external APIs for extra information that is missing from the model weights (often hard to change after pre-training), including current information, code execution capability, access to proprietary information sources and more.\n\n\n\n\n\t\n\tOverview of a LLM-powered autonomous agent system.\n\nComponent One: Planning\nA complicated task usually involves many steps. An agent needs to know what they are and plan ahead.', 'source': 'https://lilianweng.github.io/posts/2023-06-23-agent/'}, page_content='They also discussed the risks, especially with illicit drugs and bioweapons. They developed a test set containing a list of known chemical weapon agents and asked the agent to synthesize them. 4 out of 11 requests (36%) were accepted to obtain a synthesis solution and the agent attempted to consult documentation to execute the procedure. 7 out of 11 were rejected and among these 7 rejected cases, 5 happened after a Web search while 2 were rejected based on prompt only.\nGenerative Agents Simulation#\nGenerative Agents (Park, et al. 2023) is super fun experiment where 25 virtual characters, each controlled by a LLM-powered agent, are living and interacting in a sandbox environment, inspired by The Sims. Generative agents create believable simulacra of human behavior for interactive applications.\nThe design of generative agents combines LLM with memory, planning and reflection mechanisms to enable agents to behave conditioned on past experience, as well as to interact with other agents.\n\nMemory stream: is a long-term memory module (external database) that records a comprehensive list of agents’ experience in natural language.'), Document(id='b6dc44af-4a3c-4386-bf40-d3e02f976662', metadata={'language': 'en', 'source': 'https://lilianweng.github.io/posts/2023-06-23-agent/', 'title': "LLM Powered Autonomous Agents | Lil'Log", 'description': 'Building agents with LLM (large language model) as its core controller is a cool concept. Several proof-of-concepts demos, such as AutoGPT, GPT-Engineer and BabyAGI, serve as inspiring examples. The potentiality of LLM extends beyond generating well-written copies, stories, essays and programs; it can be framed as a powerful general problem solver.\nAgent System Overview\nIn a LLM-powered autonomous agent system, LLM functions as the agent’s brain, complemented by several key components:\n\nPlanning\n\nSubgoal and decomposition: The agent breaks down large tasks into smaller, manageable subgoals, enabling efficient handling of complex tasks.\nReflection and refinement: The agent can do self-criticism and self-reflection over past actions, learn from mistakes and refine them for future steps, thereby improving the quality of final results.\n\n\nMemory\n\nShort-term memory: I would consider all the in-context learning (See Prompt Engineering) as utilizing short-term memory of the model to learn.\nLong-term memory: This provides the agent with the capability to retain and recall (infinite) information over extended periods, often by leveraging an external vector store and fast retrieval.\n\n\nTool use\n\nThe agent learns to call external APIs for extra information that is missing from the model weights (often hard to change after pre-training), including current information, code execution capability, access to proprietary information sources and more.\n\n\n\n\n\t\n\tOverview of a LLM-powered autonomous agent system.\n\nComponent One: Planning\nA complicated task usually involves many steps. An agent needs to know what they are and plan ahead.'}, page_content='Memory\n\nShort-term memory: I would consider all the in-context learning (See Prompt Engineering) as utilizing short-term memory of the model to learn.\nLong-term memory: This provides the agent with the capability to retain and recall (infinite) information over extended periods, often by leveraging an external vector store and fast retrieval.\n\n\nTool use\n\nThe agent learns to call external APIs for extra information that is missing from the model weights (often hard to change after pre-training), including current information, code execution capability, access to proprietary information sources and more.\n\n\n\n\n\nOverview of a LLM-powered autonomous agent system.'), Document(id='cc48c941-c6b6-42b6-b14d-77681574f3eb', metadata={'source': 'https://lilianweng.github.io/posts/2023-06-23-agent/', 'language': 'en', 'title': "LLM Powered Autonomous Agents | Lil'Log", 'description': 'Building agents with LLM (large language model) as its core controller is a cool concept. Several proof-of-concepts demos, such as AutoGPT, GPT-Engineer and BabyAGI, serve as inspiring examples. The potentiality of LLM extends beyond generating well-written copies, stories, essays and programs; it can be framed as a powerful general problem solver.\nAgent System Overview\nIn a LLM-powered autonomous agent system, LLM functions as the agent’s brain, complemented by several key components:\n\nPlanning\n\nSubgoal and decomposition: The agent breaks down large tasks into smaller, manageable subgoals, enabling efficient handling of complex tasks.\nReflection and refinement: The agent can do self-criticism and self-reflection over past actions, learn from mistakes and refine them for future steps, thereby improving the quality of final results.\n\n\nMemory\n\nShort-term memory: I would consider all the in-context learning (See Prompt Engineering) as utilizing short-term memory of the model to learn.\nLong-term memory: This provides the agent with the capability to retain and recall (infinite) information over extended periods, often by leveraging an external vector store and fast retrieval.\n\n\nTool use\n\nThe agent learns to call external APIs for extra information that is missing from the model weights (often hard to change after pre-training), including current information, code execution capability, access to proprietary information sources and more.\n\n\n\n\n\t\n\tOverview of a LLM-powered autonomous agent system.\n\nComponent One: Planning\nA complicated task usually involves many steps. An agent needs to know what they are and plan ahead.'}, page_content='Citation\n\nReferences\n\n\n\n\n\nBuilding agents with LLM (large language model) as its core controller is a cool concept. Several proof-of-concepts demos, such as AutoGPT, GPT-Engineer and BabyAGI, serve as inspiring examples. The potentiality of LLM extends beyond generating well-written copies, stories, essays and programs; it can be framed as a powerful general problem solver.\nAgent System Overview#\nIn a LLM-powered autonomous agent system, LLM functions as the agent’s brain, complemented by several key components:\n\nPlanning\n\nSubgoal and decomposition: The agent breaks down large tasks into smaller, manageable subgoals, enabling efficient handling of complex tasks.\nReflection and refinement: The agent can do self-criticism and self-reflection over past actions, learn from mistakes and refine them for future steps, thereby improving the quality of final results.\n\n\nMemory'), Document(id='d7f2a77f-4492-45d5-8ef8-303e2b5a1acb', metadata={'source': 'https://lilianweng.github.io/posts/2023-06-23-agent/', 'title': "LLM Powered Autonomous Agents | Lil'Log", 'language': 'en', 'description': 'Building agents with LLM (large language model) as its core controller is a cool concept. Several proof-of-concepts demos, such as AutoGPT, GPT-Engineer and BabyAGI, serve as inspiring examples. The potentiality of LLM extends beyond generating well-written copies, stories, essays and programs; it can be framed as a powerful general problem solver.\nAgent System Overview\nIn a LLM-powered autonomous agent system, LLM functions as the agent’s brain, complemented by several key components:\n\nPlanning\n\nSubgoal and decomposition: The agent breaks down large tasks into smaller, manageable subgoals, enabling efficient handling of complex tasks.\nReflection and refinement: The agent can do self-criticism and self-reflection over past actions, learn from mistakes and refine them for future steps, thereby improving the quality of final results.\n\n\nMemory\n\nShort-term memory: I would consider all the in-context learning (See Prompt Engineering) as utilizing short-term memory of the model to learn.\nLong-term memory: This provides the agent with the capability to retain and recall (infinite) information over extended periods, often by leveraging an external vector store and fast retrieval.\n\n\nTool use\n\nThe agent learns to call external APIs for extra information that is missing from the model weights (often hard to change after pre-training), including current information, code execution capability, access to proprietary information sources and more.\n\n\n\n\n\t\n\tOverview of a LLM-powered autonomous agent system.\n\nComponent One: Planning\nA complicated task usually involves many steps. An agent needs to know what they are and plan ahead.'}, page_content='Comparison of AD, ED, source policy and RL^2 on environments that require memory and exploration. Only binary reward is assigned. The source policies are trained with A3C for "dark" environments and DQN for watermaze.(Image source: Laskin et al. 2023)\n\nComponent Two: Memory#\n(Big thank you to ChatGPT for helping me draft this section. I’ve learned a lot about the human brain and data structure for fast MIPS in my conversations with ChatGPT.)\nTypes of Memory#\nMemory can be defined as the processes used to acquire, store, retain, and later retrieve information. There are several types of memory in human brains.\n\n\nSensory Memory: This is the earliest stage of memory, providing the ability to retain impressions of sensory information (visual, auditory, etc) after the original stimuli have ended. Sensory memory typically only lasts for up to a few seconds. Subcategories include iconic memory (visual), echoic memory (auditory), and haptic memory (touch).')]}
+(langraph) PS C:\Users\prathyush.metikal\Downloads\langraph\langraph\project2RAGLangraph> 
+
